@@ -57,7 +57,9 @@ What gets drawn
 Corner brackets on each detection, coloured amber through red by confidence, with a label chip
 carrying the track id where there is one. A card top-left counts unique potholes and shows the
 position in the clip; a bar along the bottom fills as the video plays and grows a tick each time a
-new pothole is first seen. `--no-dashboard` drops the card and the bar.
+new pothole is first seen. `--no-dashboard` drops the card and the bar. A scrolling left-side log
+below the card adds a thumbnail + Kamera/Saat/Konum card the moment each track is confirmed,
+configurable via `--camera-name`/`--location` and toggled independently with `--no-detection-log`.
 
 Detections are also held on screen for `--hold-frames` frames after the model stops emitting them,
 fading out. That is a DISPLAY effect and nothing else — every number this script reports is counted
@@ -152,8 +154,11 @@ _PROGRESS_EVERY = 250  # frames between progress lines; ~8s of 30fps footage
 
 # Hazard ramp, BGR. Amber at the confidence threshold through to red at 1.0 — for a single-class
 # detector, grading the colour by confidence tells the viewer something a per-track rainbow cannot.
-_COLOUR_LOW = (60, 180, 255)   # amber
-_COLOUR_HIGH = (48, 48, 235)   # red
+# Blue is held near zero on both ends so the ramp reads as "alert" rather than the muddy
+# amber/rust a blue tint produces against gray asphalt; red is capped at 235, not 255, so it stays
+# visually distinct from tail-lights/red vehicles already common in dashcam footage.
+_COLOUR_LOW = (0, 195, 255)    # vivid amber/gold
+_COLOUR_HIGH = (0, 25, 235)    # vivid red
 
 _INK = (255, 255, 255)
 _INK_SHADOW = (20, 20, 20)
@@ -161,7 +166,22 @@ _PANEL_BG = (28, 24, 22)
 # Nearly opaque on purpose: dashcam footage burns its own text into the same corner, and at 0.72
 # the source video's vehicle counter reads straight through the card and collides with the count.
 _PANEL_ALPHA = 0.96
-_BOX_FILL_ALPHA = 0.18
+# The detection-log cards are a separate, lower alpha — the reference UI they're matching shows
+# the footage behind each card, not a near-solid fill like the dashboard's.
+_LOG_PANEL_ALPHA = 0.6
+_BOX_FILL_ALPHA = 0.22
+
+# Left-column layout. The dashboard card and the detection-log panel below it share a left edge
+# (_DASH_PAD) but are sized independently — the log panel is deliberately the bigger, more
+# attention-grabbing element; the compact counter card above it is left alone.
+_DASH_PAD = 14
+_DASH_CARD_W, _DASH_CARD_H = 300, 104
+_LOG_THUMB = 120           # thumbnail square side, px
+_LOG_CARD_W = 420          # total row width (thumb + gap + info card), independent of _DASH_CARD_W
+_LOG_ROW_GAP = 12          # vertical gap between history rows
+_LOG_TOP_GAP = 10          # gap between the dashboard card's bottom edge and the log panel's top
+_LOG_BOTTOM_MARGIN = 40    # keep clear of draw_timeline's bar
+_LOG_MAX_CARDS = 300       # safety cap on stored history; draw only ever shows what fits on screen
 
 # Overlays are matched to detections by track id first; this is the fallback for the ~40% of
 # detections ByteTrack never confirms, which are exactly the ones that cause the flicker.
@@ -239,6 +259,16 @@ def format_clock(seconds: float) -> str:
     return f"{int(seconds) // 60:02d}:{int(seconds) % 60:02d}"
 
 
+def format_clock_hms(seconds: float) -> str:
+    """HH:MM:SS, for the detection-log's 'Saat' field (elapsed clip position, not wall-clock).
+
+    A sibling to format_clock, not a change to it: format_clock's MM:SS output still feeds
+    draw_dashboard's clock line as-is.
+    """
+    total = int(seconds)
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
 def inside_fraction(box: np.ndarray, others: np.ndarray) -> float:
     """Largest fraction of `box`'s own area that falls inside any of `others`.
 
@@ -256,6 +286,42 @@ def inside_fraction(box: np.ndarray, others: np.ndarray) -> float:
     inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
     area = max(1e-9, (box[2] - box[0]) * (box[3] - box[1]))
     return float(np.max(inter) / area)
+
+
+def crop_box(frame: np.ndarray, box: np.ndarray) -> np.ndarray | None:
+    """Clamp an xyxy box to the frame and return the pixel crop, or None if degenerate.
+
+    Mirrors the clamp-and-slice already inlined in draw_detections rather than a third
+    reimplementation, or reaching into data_collector/detector.py's crop_detections across a
+    package boundary that has no __init__.py and assumes it is run from inside that folder.
+    """
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in box)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2].copy()
+
+
+def make_thumbnail(crop: np.ndarray, size: int) -> np.ndarray:
+    """Letterbox an arbitrary-aspect crop onto a size x size BGR square, padded with _PANEL_BG.
+
+    Squashing to a square would visibly distort a wide, short crack crop; letterboxing keeps the
+    object recognisable. Called once per card at capture time — a card is redrawn on every
+    remaining frame of the video once created, so resizing at draw time would repeat the same
+    cv2.resize call thousands of times for one card.
+    """
+    canvas = np.full((size, size, 3), _PANEL_BG, dtype=np.uint8)
+    h, w = crop.shape[:2]
+    if h == 0 or w == 0:
+        return canvas
+    scale = size / max(h, w)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x_off, y_off = (size - new_w) // 2, (size - new_h) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas
 
 
 class TrackHitCounter:
@@ -556,8 +622,7 @@ def draw_dashboard(frame: np.ndarray, unique: int, position_s: float, duration_s
     weights detect `road_damage` — cracks and patches as well as holes — and a card reading
     "POTHOLES FOUND" over a box on a crack is a claim the footage visibly contradicts.
     """
-    pad = 14
-    card_w, card_h = 300, 104
+    pad, card_w, card_h = _DASH_PAD, _DASH_CARD_W, _DASH_CARD_H
     _blend_rect(frame, pad, pad, pad + card_w, pad + card_h, _PANEL_BG, _PANEL_ALPHA)
     cv2.rectangle(frame, (pad, pad), (pad + card_w, pad + card_h), (90, 82, 78), 1, cv2.LINE_AA)
 
@@ -567,6 +632,68 @@ def draw_dashboard(frame: np.ndarray, unique: int, position_s: float, duration_s
     clock = f"{format_clock(position_s)} / {format_clock(duration_s)}" if duration_s else format_clock(position_s)
     _text(frame, clock, (pad + 132, pad + 58), 0.6, _INK, 1)
     _text(frame, f"conf {conf:.2f}", (pad + 132, pad + 84), 0.5, (168, 190, 205), 1)
+
+
+def draw_detection_log(frame: np.ndarray, cards: list[dict], top: int, scroll: float) -> None:
+    """Left-side scrolling history: one row per confirmed detection, newest at the bottom.
+
+    A SEPARATE, unrelated piece of state from OverlayStore — that governs the fading corner-bracket
+    boxes only; these cards persist for the rest of the video once created, never fade, and are not
+    coupled to hold-frames.
+
+    `scroll` is a row-offset eased toward `max(0, len(cards) - capacity)` once per frame in run()'s
+    main loop; this function just places each card at its current (possibly fractional, possibly
+    only partially inside the panel) position. That's the whole animation — position eases smoothly
+    frame to frame, this function has no notion of "animating" on its own.
+    """
+    height = frame.shape[0]
+    bottom = height - _LOG_BOTTOM_MARGIN
+    if bottom <= top or not cards:
+        return
+
+    row_pitch = _LOG_THUMB + _LOG_ROW_GAP
+    pad = _DASH_PAD
+    info_x = pad + _LOG_THUMB + 8
+    info_w = _LOG_CARD_W - _LOG_THUMB - 8
+    stripe_w = 5
+
+    # One extra row of margin below `scroll`'s integer part, so a card mid-transition is never
+    # skipped; breaks out the moment a row would start below the viewport, so this never scans the
+    # full history once it's long.
+    first = max(0, int(scroll) - 1)
+    for i in range(first, len(cards)):
+        y = top + round((i - scroll) * row_pitch)
+        if y >= bottom:
+            break
+        row_bottom = y + _LOG_THUMB
+        if row_bottom <= top:
+            continue
+
+        # Clipped to the panel's OWN viewport, not just the frame's edges — this is what stops a
+        # row sliding past top/bottom from visually bleeding into the dashboard card above or the
+        # timeline bar below.
+        draw_y0, draw_y1 = max(y, top), min(row_bottom, bottom)
+        if draw_y1 <= draw_y0:
+            continue
+
+        card = cards[i]
+        # A raw slice-assignment doesn't self-clamp like _blend_rect does — a negative start index
+        # would silently wrap instead of raising, so the thumb's source slice is clamped by hand.
+        frame[draw_y0:draw_y1, pad:pad + _LOG_THUMB] = card["thumb"][draw_y0 - y:draw_y1 - y]
+
+        _blend_rect(frame, info_x, draw_y0, info_x + info_w, draw_y1, _PANEL_BG, _LOG_PANEL_ALPHA)
+        _blend_rect(frame, info_x, draw_y0, info_x + stripe_w, draw_y1, card["colour"], 1.0)
+
+        # The border and text only render once a row has fully settled inside the viewport — a
+        # half-drawn border or a vertically-clipped glyph mid-slide reads as a rendering bug rather
+        # than motion, so those simply pop in once the row stops moving.
+        if y >= top and row_bottom <= bottom:
+            cv2.rectangle(frame, (pad, y), (pad + _LOG_THUMB, row_bottom), card["colour"], 3,
+                         cv2.LINE_AA)
+            text_x = info_x + stripe_w + 10
+            _text(frame, f"Kamera: {card['camera'][:24]}", (text_x, y + 30), 0.52, _INK, 1)
+            _text(frame, f"Saat: {card['time_str']}", (text_x, y + 66), 0.52, _INK, 1)
+            _text(frame, f"Konum: {card['location'][:24]}", (text_x, y + 102), 0.52, _INK, 1)
 
 
 def draw_timeline(frame: np.ndarray, position: float, marks: list[float]) -> None:
@@ -820,6 +947,8 @@ def run(args: argparse.Namespace) -> int:
         logger.info("display: %s, hold %s (cosmetic only — reported counts are raw)",
                     "boxes only" if args.no_dashboard else "dashboard",
                     f"{args.hold_frames} frame(s)" if args.hold_frames else "off")
+        logger.info("overlay: detection log %s, camera=%r, location=%r",
+                    "off" if args.no_detection_log else "on", args.camera_name, args.location)
         logger.info("output : %s (%s @ %.3f fps)", out_path, args.fourcc, out_fps)
 
         if args.every > 1 and not args.no_track:
@@ -850,7 +979,20 @@ def run(args: argparse.Namespace) -> int:
         # line is allowed to feed the summary run() prints.
         overlays = OverlayStore(args.hold_frames)
         timeline_marks: list[float] = []
+        detection_log: list[dict] = []
         duration_s = total_frames / source_fps if total_frames else 0.0
+
+        # Fixed for the whole run (depend only on args and the frame size), so computed once
+        # rather than on every frame.
+        log_top = (_DASH_PAD + _DASH_CARD_H + _LOG_TOP_GAP) if not args.no_dashboard else _DASH_PAD
+        log_row_pitch = _LOG_THUMB + _LOG_ROW_GAP
+        log_capacity = max(0, (height - log_top - _LOG_BOTTOM_MARGIN) // log_row_pitch)
+        log_scroll = 0.0
+        # Exponential smoothing: reaches ~95% of the way to a new target within --log-anim-seconds,
+        # regardless of the output fps. 0 (or negative) disables the animation outright — scroll
+        # snaps straight to target every frame, matching the old hard-cut behaviour.
+        log_ease_rate = (1.0 if args.log_anim_seconds <= 0
+                         else 1.0 - 0.05 ** ((1.0 / out_fps) / args.log_anim_seconds))
 
         try:
             for index, frame in iter_sampled_frames(
@@ -923,6 +1065,29 @@ def run(args: argparse.Namespace) -> int:
                     # One tick the first time a track appears, not one per frame it persists.
                     timeline_marks.append(index / total_frames)
 
+                if fresh_ids and not args.no_detection_log:
+                    # track_ids is parallel to boxes/scores, not indexed by id — build the lookup
+                    # once per frame rather than scanning it per id.
+                    id_to_index = {tid: i for i, tid in enumerate(track_ids) if tid is not None}
+                    # Sorted for a deterministic append order on the rare frame where more than one
+                    # track is confirmed at once — not "newest id first", just a stable tie-break.
+                    for track_id in sorted(fresh_ids):
+                        i = id_to_index.get(track_id)
+                        if i is None:
+                            continue
+                        crop = crop_box(frame, boxes[i])
+                        if crop is None:
+                            continue
+                        detection_log.append({
+                            "thumb": make_thumbnail(crop, _LOG_THUMB),
+                            "colour": colour_for(float(scores[i]), args.conf),
+                            "camera": args.camera_name,
+                            "time_str": format_clock_hms(position),
+                            "location": args.location,
+                        })
+                    if len(detection_log) > _LOG_MAX_CARDS:
+                        del detection_log[: len(detection_log) - _LOG_MAX_CARDS]
+
                 overlays.update(index, boxes, scores, track_ids, classes)
                 draw_detections(frame, overlays.visible(index), model.names, args.conf)
                 if not args.no_dashboard:
@@ -930,6 +1095,12 @@ def run(args: argparse.Namespace) -> int:
                                    dashboard_heading)
                     if total_frames:
                         draw_timeline(frame, index / total_frames, timeline_marks)
+                if not args.no_detection_log:
+                    # Eased every frame, not just when a new card lands — the slide keeps moving
+                    # for several frames after the trigger, until scroll catches up with target.
+                    log_target = max(0.0, len(detection_log) - log_capacity)
+                    log_scroll += (log_target - log_scroll) * log_ease_rate
+                    draw_detection_log(frame, detection_log, log_top, log_scroll)
                 writer.write(frame)
 
                 if args.show:
@@ -1096,6 +1267,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-dashboard", action="store_true",
                    help="draw only the detection boxes, without the counter card or the timeline "
                         "bar (default off)")
+    p.add_argument("--camera-name", default="Zabita Araci 03",
+                   help="camera name shown as 'Kamera' on each detection-log card "
+                        "(default 'Zabita Araci 03')")
+    p.add_argument("--location", default="12.15.124.78",
+                   help="location string shown as 'Konum' on each detection-log card — an "
+                        "arbitrary placeholder, not a real GPS value (default '12.15.124.78')")
+    p.add_argument("--no-detection-log", action="store_true",
+                   help="drop the left-side scrolling detection-log panel (thumbnail + "
+                        "Kamera/Saat/Konum card per confirmed detection); independent of "
+                        "--no-dashboard, which only controls the counter card and timeline bar "
+                        "(default off)")
+    p.add_argument("--log-anim-seconds", type=float, default=0.3,
+                   help="how long the detection-log panel takes to settle after a new card pushes "
+                        "it past capacity — an eased slide, not a hard cut. 0 disables the "
+                        "animation (instant snap to the latest cards) (default 0.3)")
     p.add_argument("--no-track", action="store_true",
                    help="detect each frame independently instead of tracking objects across "
                         "frames; output will flicker more (default off)")
